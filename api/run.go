@@ -1,10 +1,185 @@
 package main
-import("encoding/json";"math";"net/http";"sort";"sync";"time")
-type runInput struct{BreakerID string `json:"breakerId"`;CallCount int `json:"callCount"`;Concurrency int `json:"concurrency"`;UpstreamErrorRatePct float64 `json:"upstreamErrorRatePct"`;UpstreamLatencyMs int `json:"upstreamLatencyMs"`;FallbackEnabled bool `json:"fallbackEnabled"`;AdvanceCooldown bool `json:"advanceCooldown"`}
-type trace struct{Index int `json:"index"`;Outcome string `json:"outcome"`;StateBefore string `json:"stateBefore"`;StateAfter string `json:"stateAfter"`;UpstreamCalled bool `json:"upstreamCalled"`;FallbackServed bool `json:"fallbackServed"`;LatencyMs float64 `json:"latencyMs"`;Detail string `json:"detail"`}
-type transition struct{From string `json:"from"`;To string `json:"to"`;AtCall int `json:"atCall"`;Reason string `json:"reason"`}
-func RunHandler(w http.ResponseWriter,r *http.Request){if r.Method==http.MethodOptions{w.WriteHeader(204);return};if r.Method!=http.MethodPost{w.Header().Set("Allow","POST, OPTIONS");errOut(w,405,"method not allowed");return};var in runInput;if e:=json.NewDecoder(http.MaxBytesReader(w,r.Body,1<<20)).Decode(&in);e!=nil{errOut(w,400,"invalid JSON");return};in.CallCount=clamp(in.CallCount,1,500);in.Concurrency=clamp(in.Concurrency,1,100);in.UpstreamErrorRatePct=math.Max(0,math.Min(100,in.UpstreamErrorRatePct));in.UpstreamLatencyMs=clamp(in.UpstreamLatencyMs,1,30000);app.mu.Lock();b:=app.breakers[in.BreakerID];app.mu.Unlock();if b==nil{errOut(w,404,"breaker not found");return};traces:=make([]trace,in.CallCount);transitions:=[]transition{};var wg sync.WaitGroup;sem:=make(chan struct{},in.Concurrency)
-for i:=0;i<in.CallCount;i++{wg.Add(1);sem<-struct{}{};go func(i int){defer wg.Done();defer func(){<-sem}();app.mu.Lock();defer app.mu.Unlock();before:=b.State;t:=trace{Index:i+1,StateBefore:before}
-if b.State=="OPEN"{if in.AdvanceCooldown&&b.OpenStepsRemaining>0{b.OpenStepsRemaining--};if in.AdvanceCooldown&&b.OpenStepsRemaining<=0{b.State="HALF_OPEN";b.HalfOpenAttempts=0;b.HalfOpenSuccesses=0;transitions=append(transitions,transition{"OPEN","HALF_OPEN",i+1,"cooldown elapsed"})}else{t.Outcome="SHORT_CIRCUITED";t.Detail="circuit open; upstream skipped";b.TotalShortCircuited++;if in.FallbackEnabled{t.Outcome="FALLBACK";t.FallbackServed=true;t.Detail="fallback served"}}}
-if b.State=="CLOSED"||b.State=="HALF_OPEN"{if b.State=="HALF_OPEN"&&b.HalfOpenAttempts>=b.HalfOpenMaxProbes{b.State="OPEN";b.OpenStepsRemaining=b.OpenCooldownSteps;t.Outcome="SHORT_CIRCUITED";t.Detail="probe budget exhausted";transitions=append(transitions,transition{"HALF_OPEN","OPEN",i+1,"probe budget exhausted"})}else{t.UpstreamCalled=true;t.LatencyMs=float64(in.UpstreamLatencyMs);b.TotalCalls++;failed:=app.rng.Float64()*100<in.UpstreamErrorRatePct;if failed{b.TotalFailures++;t.Outcome="UPSTREAM_FAILURE";t.Detail="simulated upstream failure";if b.State=="HALF_OPEN"{b.State="OPEN";b.OpenStepsRemaining=b.OpenCooldownSteps;b.HalfOpenAttempts=0;b.HalfOpenSuccesses=0;transitions=append(transitions,transition{"HALF_OPEN","OPEN",i+1,"recovery probe failed"})}else{b.ConsecutiveFailures++;b.window=append(b.window,true);if len(b.window)>b.RollingWindowSize{b.window=b.window[1:]};if b.ConsecutiveFailures>=b.FailureThreshold||failures(b.window)>=b.FailureThreshold{b.State="OPEN";b.OpenStepsRemaining=b.OpenCooldownSteps;transitions=append(transitions,transition{"CLOSED","OPEN",i+1,"failure threshold reached"})}}}else{t.Outcome="SUCCESS";t.Detail="upstream call succeeded";if b.State=="HALF_OPEN"{b.HalfOpenAttempts++;b.HalfOpenSuccesses++;if b.HalfOpenSuccesses>=b.HalfOpenSuccessThreshold{b.State="CLOSED";b.ConsecutiveFailures=0;b.window=nil;b.HalfOpenAttempts=0;b.HalfOpenSuccesses=0;transitions=append(transitions,transition{"HALF_OPEN","CLOSED",i+1,"recovery success threshold met"})}}else{b.ConsecutiveFailures=0;b.window=append(b.window,false);if len(b.window)>b.RollingWindowSize{b.window=b.window[1:]}}}}}
-if t.FallbackServed{t.LatencyMs=.2};if t.Outcome==""{t.Outcome="SHORT_CIRCUITED"};t.StateAfter=b.State;b.UpdatedAt=time.Now().UTC();traces[i]=t}(i)};wg.Wait();app.mu.Lock();out:=clone(b);app.mu.Unlock();sort.Slice(transitions,func(i,j int)bool{return transitions[i].AtCall<transitions[j].AtCall});allowed,short,fb:=0,0,0;for _,t:=range traces{if t.UpstreamCalled{allowed++};if t.Outcome=="SHORT_CIRCUITED"{short++};if t.FallbackServed{fb++}};jsonOut(w,200,map[string]any{"breaker":out,"allowedUpstreamCalls":allowed,"shortCircuitedCalls":short,"fallbackServedCalls":fb,"stateTransitions":transitions,"traces":traces,"estimatedFastFailLatencyMs":0.2,"upstreamLatencyMs":in.UpstreamLatencyMs})}
+
+import (
+	"encoding/json"
+	"math"
+	"net/http"
+	"sort"
+	"sync"
+	"time"
+)
+
+type runInput struct {
+	BreakerID            string  `json:"breakerId"`
+	CallCount            int     `json:"callCount"`
+	Concurrency          int     `json:"concurrency"`
+	UpstreamErrorRatePct float64 `json:"upstreamErrorRatePct"`
+	UpstreamLatencyMs    int     `json:"upstreamLatencyMs"`
+	FallbackEnabled      bool    `json:"fallbackEnabled"`
+	AdvanceCooldown      bool    `json:"advanceCooldown"`
+}
+type trace struct {
+	Index          int     `json:"index"`
+	Outcome        string  `json:"outcome"`
+	StateBefore    string  `json:"stateBefore"`
+	StateAfter     string  `json:"stateAfter"`
+	UpstreamCalled bool    `json:"upstreamCalled"`
+	FallbackServed bool    `json:"fallbackServed"`
+	LatencyMs      float64 `json:"latencyMs"`
+	Detail         string  `json:"detail"`
+}
+type transition struct {
+	From   string `json:"from"`
+	To     string `json:"to"`
+	AtCall int    `json:"atCall"`
+	Reason string `json:"reason"`
+}
+
+func RunHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(204)
+		return
+	}
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST, OPTIONS")
+		errOut(w, 405, "method not allowed")
+		return
+	}
+	var in runInput
+	if e := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&in); e != nil {
+		errOut(w, 400, "invalid JSON")
+		return
+	}
+	in.CallCount = clamp(in.CallCount, 1, 500)
+	in.Concurrency = clamp(in.Concurrency, 1, 100)
+	in.UpstreamErrorRatePct = math.Max(0, math.Min(100, in.UpstreamErrorRatePct))
+	in.UpstreamLatencyMs = clamp(in.UpstreamLatencyMs, 1, 30000)
+	app.mu.Lock()
+	b := app.breakers[in.BreakerID]
+	app.mu.Unlock()
+	if b == nil {
+		errOut(w, 404, "breaker not found")
+		return
+	}
+	traces := make([]trace, in.CallCount)
+	transitions := []transition{}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, in.Concurrency)
+	for i := 0; i < in.CallCount; i++ {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			app.mu.Lock()
+			defer app.mu.Unlock()
+			before := b.State
+			t := trace{Index: i + 1, StateBefore: before}
+			if b.State == "OPEN" {
+				if in.AdvanceCooldown && b.OpenStepsRemaining > 0 {
+					b.OpenStepsRemaining--
+				}
+				if in.AdvanceCooldown && b.OpenStepsRemaining <= 0 {
+					b.State = "HALF_OPEN"
+					b.HalfOpenAttempts = 0
+					b.HalfOpenSuccesses = 0
+					transitions = append(transitions, transition{"OPEN", "HALF_OPEN", i + 1, "cooldown elapsed"})
+				} else {
+					t.Outcome = "SHORT_CIRCUITED"
+					t.Detail = "circuit open; upstream skipped"
+					b.TotalShortCircuited++
+					if in.FallbackEnabled {
+						t.Outcome = "FALLBACK"
+						t.FallbackServed = true
+						t.Detail = "fallback served"
+					}
+				}
+			}
+			if b.State == "CLOSED" || b.State == "HALF_OPEN" {
+				if b.State == "HALF_OPEN" && b.HalfOpenAttempts >= b.HalfOpenMaxProbes {
+					b.State = "OPEN"
+					b.OpenStepsRemaining = b.OpenCooldownSteps
+					t.Outcome = "SHORT_CIRCUITED"
+					t.Detail = "probe budget exhausted"
+					transitions = append(transitions, transition{"HALF_OPEN", "OPEN", i + 1, "probe budget exhausted"})
+				} else {
+					t.UpstreamCalled = true
+					t.LatencyMs = float64(in.UpstreamLatencyMs)
+					b.TotalCalls++
+					failed := app.rng.Float64()*100 < in.UpstreamErrorRatePct
+					if failed {
+						b.TotalFailures++
+						t.Outcome = "UPSTREAM_FAILURE"
+						t.Detail = "simulated upstream failure"
+						if b.State == "HALF_OPEN" {
+							b.State = "OPEN"
+							b.OpenStepsRemaining = b.OpenCooldownSteps
+							b.HalfOpenAttempts = 0
+							b.HalfOpenSuccesses = 0
+							transitions = append(transitions, transition{"HALF_OPEN", "OPEN", i + 1, "recovery probe failed"})
+						} else {
+							b.ConsecutiveFailures++
+							b.window = append(b.window, true)
+							if len(b.window) > b.RollingWindowSize {
+								b.window = b.window[1:]
+							}
+							if b.ConsecutiveFailures >= b.FailureThreshold || failures(b.window) >= b.FailureThreshold {
+								b.State = "OPEN"
+								b.OpenStepsRemaining = b.OpenCooldownSteps
+								transitions = append(transitions, transition{"CLOSED", "OPEN", i + 1, "failure threshold reached"})
+							}
+						}
+					} else {
+						t.Outcome = "SUCCESS"
+						t.Detail = "upstream call succeeded"
+						if b.State == "HALF_OPEN" {
+							b.HalfOpenAttempts++
+							b.HalfOpenSuccesses++
+							if b.HalfOpenSuccesses >= b.HalfOpenSuccessThreshold {
+								b.State = "CLOSED"
+								b.ConsecutiveFailures = 0
+								b.window = nil
+								b.HalfOpenAttempts = 0
+								b.HalfOpenSuccesses = 0
+								transitions = append(transitions, transition{"HALF_OPEN", "CLOSED", i + 1, "recovery success threshold met"})
+							}
+						} else {
+							b.ConsecutiveFailures = 0
+							b.window = append(b.window, false)
+							if len(b.window) > b.RollingWindowSize {
+								b.window = b.window[1:]
+							}
+						}
+					}
+				}
+			}
+			if t.FallbackServed {
+				t.LatencyMs = .2
+			}
+			if t.Outcome == "" {
+				t.Outcome = "SHORT_CIRCUITED"
+			}
+			t.StateAfter = b.State
+			b.UpdatedAt = time.Now().UTC()
+			traces[i] = t
+		}(i)
+	}
+	wg.Wait()
+	app.mu.Lock()
+	out := clone(b)
+	app.mu.Unlock()
+	sort.Slice(transitions, func(i, j int) bool { return transitions[i].AtCall < transitions[j].AtCall })
+	allowed, short, fb := 0, 0, 0
+	for _, t := range traces {
+		if t.UpstreamCalled {
+			allowed++
+		}
+		if t.Outcome == "SHORT_CIRCUITED" {
+			short++
+		}
+		if t.FallbackServed {
+			fb++
+		}
+	}
+	jsonOut(w, 200, map[string]any{"breaker": out, "allowedUpstreamCalls": allowed, "shortCircuitedCalls": short, "fallbackServedCalls": fb, "stateTransitions": transitions, "traces": traces, "estimatedFastFailLatencyMs": 0.2, "upstreamLatencyMs": in.UpstreamLatencyMs})
+}
